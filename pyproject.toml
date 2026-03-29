@@ -8,13 +8,3 @@ dependencies = [
     "flux",
     "modal>=1.4.0",
 ]
-
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[tool.uv.sources]
-torchvision = { index = "pytorch-cpu" }
-flux = { git = "https://github.com/BhagyeshKothalkar/flux2" }

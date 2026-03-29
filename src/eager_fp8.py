@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Literal, Optional
@@ -5,6 +6,7 @@ from typing import List, Literal, Optional
 import modal
 import torch
 import torch.nn as nn
+from flux2.util import FLUX2_MODEL_INFO
 
 ckpts_vol = modal.Volume.from_name("flux2_ckpts", create_if_missing=True)
 inductor_vol = modal.Volume.from_name("inductor_aot_models", create_if_missing=True)
@@ -13,6 +15,7 @@ nv_cache_vol = modal.Volume.from_name("nv-cache", create_if_missing=True)
 triton_cache_vol = modal.Volume.from_name("triton-cache", create_if_missing=True)
 ckpts_path = "/checkpoints"
 aot_path = "/artifacts"
+
 
 image = (
     modal.Image.from_registry(
@@ -29,6 +32,11 @@ image = (
             "TRITON_CACHE_DIR": "/root/.triton",
             "CUDA_CACHE_PATH": "/root/.nv",
         }
+    )
+    .uv_pip_install(
+        "git+https://github.com/pytorch/ao@f6f29f6583a26031d3ed96e125f85cd00abbef73",
+        extra_index_url="https://pypi.nvidia.com",
+        extra_options="--no-build-isolation",
     )
 )
 
@@ -110,7 +118,10 @@ def save_image_bytes(img_bytes, save_name="output.png"):
 
 gpu = "L40S"
 compilation_suffix = "O3"
-safe_model_name = "flux_2_klein_9b"
+safe_model_name = "flux_2_klein_4b"
+
+
+model_name = "flux.2-klein-4b"
 
 
 @app.cls(
@@ -129,11 +140,8 @@ class FluxRun:
     @modal.enter()
     def enter(self):
 
-        import os
+        from flux2.util import load_ae, load_flow_model, load_text_encoder
 
-        from flux2.util import FLUX2_MODEL_INFO, load_ae, load_text_encoder
-
-        model_name = "flux.2-klein-9b"
         self.model_info = FLUX2_MODEL_INFO[model_name]
 
         self.device = torch.device("cuda")
@@ -146,8 +154,8 @@ class FluxRun:
             f"{safe_model_name}_{gpu}_{compilation_suffix}.pt2",
         )
         self.text_encoder = load_text_encoder(model_name, self.device)
-        self.loaded_model = wrapper(
-            torch._inductor.aoti_load_package(self.package_path)
+        self.loaded_model = load_flow_model(
+            model_name, debug_mode=False, device=self.device
         )
         self.ae = load_ae(model_name)
         self.loaded_model.eval()
@@ -159,6 +167,8 @@ class FluxRun:
         defaults = self.model_info.get("defaults", {})
         self.cfg.num_steps = defaults["num_steps"]
         self.cfg.guidance = defaults["guidance"]
+        self.cfg.height = 512
+        self.cfg.width = 512
 
     @modal.method()
     def infer(self, prompt: str, cond_image_b64: str):
@@ -196,6 +206,7 @@ class FluxRun:
                 self.cfg.prompt = prompt
             height = self.cfg.height
             width = self.cfg.width
+            print(height, width)
             img = Image.open(inp_path)
             img_ctx: List[Image.Image] = [img, img]
             prompt_batch = [prompt, prompt]
@@ -225,7 +236,7 @@ class FluxRun:
                 print(f"pre-denoising things took {t2 - t1}")
                 denoise_fn = denoise
                 x = denoise_fn(
-                    self.loaded_model,  # type:ignore
+                    self.loaded_model,
                     x,
                     x_ids,
                     ctx,
@@ -251,22 +262,113 @@ class FluxRun:
                 return image_b64
 
 
-"""
-flux model: 
-x.shape torch.Size([1, 4096, 128])
-x_ids.shape torch.Size([1, 4096, 4])
-ctx.shape torch.Size([1, 512, 12288])
-ctx_ids.shape torch.Size([1, 512, 4])
-timesteps [1.0, 0.9673840403556824, 0.9081438779830933, 0.7671999335289001, 0.0]
-self.cfg.guidance 1.0
-ref_tokens.shape torch.Size([1, 4096, 128])
-ref_ids.shape torch.Size([1, 4096, 4])
-"""
+# @app.cls(
+#     image=image,
+#     gpu="L40S",
+#     secrets=[modal.Secret.from_name("huggingface-secret")],
+#     volumes={
+#         ckpts_path: ckpts_vol,
+#         aot_path: inductor_vol,
+#         "/root/.nv": nv_cache_vol,
+#         "/root/.triton": triton_cache_vol,
+#         "/root/.inductor-cache": inductor_cache_vol,
+#     },
+# )
+# class Quantizer:
+#     @modal.enter()
+#     def enter(self):
+
+#         from flux2.util import load_flow_model
+
+#         self.device = torch.device("cuda")
+
+#         self.model = load_flow_model(model_name, debug_mode=True, device=self.device)
+#         self.model.eval()
+#         print(self.model.out_channels)
+
+#     @modal.method()
+#     def quantize(self):
+#         b = 2
+#         x = torch.rand((b, 4096, 128), device=self.device, dtype=torch.bfloat16)
+#         x_ids = torch.rand((b, 4096, 4), device=self.device, dtype=torch.bfloat16)
+#         ctx = torch.rand((b, 512, 7680), device=self.device, dtype=torch.bfloat16)
+#         ctx_ids = torch.rand((b, 512, 4), device=self.device, dtype=torch.bfloat16)
+#         timesteps = torch.rand((b,), device=self.device, dtype=torch.bfloat16)
+#         guidance = torch.full((b,), 1.0, device=self.device, dtype=torch.bfloat16)
+#         ref_tokens = torch.rand(
+#             (b, 4096, 128), device=self.device, dtype=torch.bfloat16
+#         )
+#         ref_ids = torch.rand((b, 4096, 4), device=self.device, dtype=torch.bfloat16)
+#         x = torch.cat((x, ref_tokens), dim=1)
+#         x_ids = torch.cat((x_ids, ref_ids), dim=1)
+#         self.dummy_args = (
+#             x,
+#             x_ids,
+#             timesteps,
+#             ctx,
+#             ctx_ids,
+#             guidance,
+#         )
+#         from torchao.quantization import (
+#             Float8StaticActivationFloat8WeightConfig,
+#             Int8StaticActivationInt8WeightConfig,
+#             quantize_,
+#         )
+
+#         try:
+#             print(Float8StaticActivationFloat8WeightConfig.__doc__)
+#             print(Int8StaticActivationInt8WeightConfig.__doc__)
+#         except Exception as e:
+#             print(e)
+#             print("skipping doc printing")
+
+#         quantize_(
+#             self.model,
+#             Float8StaticActivationFloat8WeightConfig(
+#                 step=("prepare"),
+#                 activation_dtype=torch.float8_e4m3fn,
+#                 weight_dtype=torch.float8_e4m3fn,
+#             ),
+#         )
+
+#         # with torch.no_grad():
+#         #     for _ in range(10):
+#         #         self.model(self.dummy_args)
+
+#         with torch.no_grad():
+#             for _ in range(10):
+#                 self.model(
+#                     x,
+#                     x_ids,
+#                     timesteps,
+#                     ctx,
+#                     ctx_ids,
+#                     guidance,
+#                 )
+
+#         quantize_(
+#             self.model,
+#             Float8StaticActivationFloat8WeightConfig(
+#                 step=("convert"),
+#                 activation_dtype=torch.float8_e4m3fn,
+#                 weight_dtype=torch.float8_e4m3fn,
+#             ),
+#         )
+
+#         exported_model = torch.export.export(self.model, args=self.dummy_args)
+
+#         print("Exported Successfully!")
+#         print(exported_model)
+#         # Verification: Check if weights are actually Float8
+#         for name, param in self.model.named_parameters():
+#             if "weight" in name and hasattr(param, "dtype"):
+#                 print(f"Layer {name} dtype: {param.dtype}")
+#                 break  # Just check the first one
 
 
 @app.cls(
     image=image,
-    gpu=gpu,
+    gpu="L40S",
     secrets=[modal.Secret.from_name("huggingface-secret")],
     volumes={
         ckpts_path: ckpts_vol,
@@ -275,35 +377,33 @@ ref_ids.shape torch.Size([1, 4096, 4])
         "/root/.triton": triton_cache_vol,
         "/root/.inductor-cache": inductor_cache_vol,
     },
-    timeout=3000,
+    timeout=4500,
 )
-class Compiler:
+class Quantizer:
     @modal.enter()
     def enter(self):
-        pass
 
-        import multiprocessing
-        import os
-
-        import torch._inductor.config as inductor_config
         from flux2.util import load_flow_model
 
-        model_name = "flux.2-klein-9b"
-        device = torch.device("cuda")
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA not found")
-        self.model = load_flow_model(model_name, device=device)
-        ckpts_vol.commit()
+        self.device = torch.device("cuda")
+
+        self.model = load_flow_model(model_name, debug_mode=True, device=self.device)
         self.model.eval()
+        print(self.model.out_channels)
+
+    @modal.method()
+    def quantize(self):
         b = 2
-        x = torch.rand((b, 4096, 128), device=device, dtype=torch.bfloat16)
-        x_ids = torch.rand((b, 4096, 4), device=device, dtype=torch.bfloat16)
-        ctx = torch.rand((b, 512, 12288), device=device, dtype=torch.bfloat16)
-        ctx_ids = torch.rand((b, 512, 4), device=device, dtype=torch.bfloat16)
-        timesteps = torch.rand((b,), device=device, dtype=torch.bfloat16)
-        guidance = torch.full((b,), 1.0, device=device, dtype=torch.bfloat16)
-        ref_tokens = torch.rand((b, 4096, 128), device=device, dtype=torch.bfloat16)
-        ref_ids = torch.rand((b, 4096, 4), device=device, dtype=torch.bfloat16)
+        x = torch.rand((b, 4096, 128), device=self.device, dtype=torch.bfloat16)
+        x_ids = torch.rand((b, 4096, 4), device=self.device, dtype=torch.bfloat16)
+        ctx = torch.rand((b, 512, 7680), device=self.device, dtype=torch.bfloat16)
+        ctx_ids = torch.rand((b, 512, 4), device=self.device, dtype=torch.bfloat16)
+        timesteps = torch.rand((b,), device=self.device, dtype=torch.bfloat16)
+        guidance = torch.full((b,), 1.0, device=self.device, dtype=torch.bfloat16)
+        ref_tokens = torch.rand(
+            (b, 4096, 128), device=self.device, dtype=torch.bfloat16
+        )
+        ref_ids = torch.rand((b, 4096, 4), device=self.device, dtype=torch.bfloat16)
         x = torch.cat((x, ref_tokens), dim=1)
         x_ids = torch.cat((x_ids, ref_ids), dim=1)
         self.dummy_args = (
@@ -314,13 +414,68 @@ class Compiler:
             ctx_ids,
             guidance,
         )
-        self.package_path = os.path.join(
-            aot_path,
-            safe_model_name,
-            f"{safe_model_name}_{gpu}_{compilation_suffix}.pt2",
+        from torchao.quantization import (
+            Float8StaticActivationFloat8WeightConfig,
+            quantize_,
         )
-        os.makedirs(os.path.dirname(self.package_path), exist_ok=True)
-        torch.set_float32_matmul_precision("high")
+
+        # try:
+        #     print(Float8StaticActivationFloat8WeightConfig.__doc__)
+        #     print(Int8StaticActivationInt8WeightConfig.__doc__)
+        # except Exception as e:
+        #     print(e)
+        #     print("skipping doc printing")
+
+        quantize_(
+            self.model,
+            Float8StaticActivationFloat8WeightConfig(
+                step=("prepare"),
+                activation_dtype=torch.float8_e4m3fn,
+                weight_dtype=torch.float8_e4m3fn,
+            ),
+        )
+
+        # with torch.no_grad():
+        #     for _ in range(10):
+        #         self.model(self.dummy_args)
+
+        import time
+
+        t01 = time.perf_counter()
+        with torch.no_grad():
+            for _ in range(10):
+                self.model(
+                    x,
+                    x_ids,
+                    timesteps,
+                    ctx,
+                    ctx_ids,
+                    guidance,
+                )
+        t02 = time.perf_counter()
+
+        quantize_(
+            self.model,
+            Float8StaticActivationFloat8WeightConfig(
+                step=("convert"),
+                activation_dtype=torch.float8_e4m3fn,
+                weight_dtype=torch.float8_e4m3fn,
+            ),
+        )
+
+        exported_model = torch.export.export(self.model, args=self.dummy_args)
+
+        print("Exported Successfully!")
+        # print(exported_model)
+        # Verification: Check if weights are actually Float8
+        for name, param in self.model.named_parameters():
+            if "weight" in name and hasattr(param, "dtype"):
+                print(f"Layer {name} dtype: {param.dtype}")
+                break  # Just check the first one
+
+        import multiprocessing
+
+        import torch._inductor.config as inductor_config
 
         inductor_config.compile_threads = multiprocessing.cpu_count()
         inductor_config.fx_graph_cache = True
@@ -342,36 +497,48 @@ class Compiler:
         inductor_config.triton.store_cubin = True
         inductor_config.aot_inductor.package = True
 
-        os.environ["TORCH_INDUCTOR_CPP_VEC_ISA"] = "avx2"
-        inductor_config.cpp.vec_isa_ok = False
-
-    @modal.method()
-    def compile(self):
-        print("starting compilaiton")
-
-        from torch.export import export
+        # os.environ["TORCH_INDUCTOR_CPP_VEC_ISA"] = "avx2"
+        # inductor_config.cpp.vec_isa_ok = False
 
         with torch.no_grad():
-            try:
-                print("exporting...")
-                exported_program = export(self.model, self.dummy_args, strict=False)
-                print("AOT Compiling to .pt2 (Fast Mode)...")
-                output_path = torch._inductor.aoti_compile_and_package(
-                    exported_program,
-                    package_path=self.package_path,
-                )
-                print("committing")
-                inductor_vol.commit()
-                print("saved to:", output_path)
-                nv_cache_vol.commit()
-                triton_cache_vol.commit()
-                inductor_cache_vol.commit()
-                print("done committing")
-            except Exception as e:
-                print("error  while compiling", e)
-                raise e
-        return output_path
+            print("AOT Compiling to .pt2 (Fast Mode)...")
+            output_path = torch._inductor.aoti_compile_and_package(
+                exported_model,
+                package_path="./model.pt2",
+            )
 
+        self.loaded_model = wrapper(torch._inductor.aoti_load_package("./model.pt2"))
+        t11 = time.perf_counter()
+        with torch.no_grad():
+            for _ in range(10):
+                self.loaded_model(
+                    x,
+                    x_ids,
+                    timesteps,
+                    ctx,
+                    ctx_ids,
+                    guidance,
+                )
+        t12 = time.perf_counter()
+
+        print(
+            "done, summary: ",
+            f"{t02 - t01} for the eager mode while quantizing",
+            f"{t12 - t11} after quantize+export (rather be something like 4x)",
+        )
+
+
+"""
+flux model: 
+x.shape torch.Size([1, 4096, 128])
+x_ids.shape torch.Size([1, 4096, 4])
+ctx.shape torch.Size([1, 512, 12288])
+ctx_ids.shape torch.Size([1, 512, 4])
+timesteps [1.0, 0.9673840403556824, 0.9081438779830933, 0.7671999335289001, 0.0]
+self.cfg.guidance 1.0
+ref_tokens.shape torch.Size([1, 4096, 128])
+ref_ids.shape torch.Size([1, 4096, 4])
+"""
 
 edit_prompt = """
 generate the image of the same person in the same setting with the following changes: 
@@ -390,36 +557,37 @@ overall appearance of the exercise. Make sure that the person's identity, equipm
 @app.local_entrypoint()
 def hi():
 
-    import base64
+    # import base64
 
-    from PIL import Image
+    # from PIL import Image
 
-    input_image_path = "assets/input/input.png"
-    prompt = edit_prompt
+    # input_image_path = "assets/input/input.png"
+    # prompt = edit_prompt
 
-    input_image = Image.open(input_image_path).resize((1024, 1024))
-    instance = FluxRun()
-    # compilaiton = Compiler()
-    # handle = compilaiton.compile.spawn()
+    # input_image = Image.open(input_image_path).resize((512, 512))
+    # instance = FluxRun()
+    # b64_string = img_to_b64_string(input_image)
+    # output_b64_string = instance.infer.remote(prompt, b64_string)
+    # output_bytes = base64.b64decode(output_b64_string)
+    # save_image_bytes(output_bytes, "assets/output/output.png")
+    instance = Quantizer()
+    handle = instance.quantize.spawn()
 
-    # try:
-    #     while True:
-    #         try:
-    #             handle.get(timeout=30)
-    #             print("Compilation complete.")
-    #             break
-    #         except TimeoutError:
-    #             print(f"--- [Local Heartbeat] Still waiting for {handle.object_id}... ---")
-    #             continue
-    # except Exception as e:
-    #     print(f"Task failed or timed out: {e}")
+    try:
+        while True:
+            try:
+                handle.get(timeout=30)
+                print("Compilation complete.")
+                break
+            except TimeoutError:
+                print(
+                    f"--- [Local Heartbeat] Still waiting for {handle.object_id}... ---"
+                )
+                continue
+    except Exception as e:
+        print(f"Task failed or timed out: {e}")
 
-    # print("sleeping to ensure sync")
-    # import time
+    print("sleeping to ensure sync")
+    import time
 
-    # time.sleep(10)
-
-    b64_string = img_to_b64_string(input_image)
-    output_b64_string = instance.infer.remote(prompt, b64_string)
-    output_bytes = base64.b64decode(output_b64_string)
-    save_image_bytes(output_bytes, "assets/output/output.png")
+    time.sleep(10)
